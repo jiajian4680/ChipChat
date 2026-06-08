@@ -4,6 +4,8 @@ let myPhone = "", myUsername = "", myKeys = null, selectedTarget = "", selectedU
 let allConversations = {}, unreadCounts = {}, allRemarks = {}, isEditing = false, editMsgId = null;
 let myBlockedUsers = [];
 let forgotFlowData = { phone: "", otp: ""};
+let isLoadingOfflineMessages = false;
+
 window.allUsers = [];
 
 // ====================== INDEXED-DB (UNLIMITED STORAGE) ======================
@@ -83,8 +85,21 @@ function closeContactInfo() {
 async function saveRemark() {
     const remark = document.getElementById("info-remark").value.trim();
     const phone = document.getElementById("info-phone").value;
-    if (remark) allRemarks[phone] = remark;
-    else delete allRemarks[phone];
+
+    if (remark) {
+        const duplicatePhone = Object.keys(allRemarks).find(p =>
+            p !== phone &&
+            allRemarks[p].toLowerCase() === remark.toLowerCase()
+        );
+
+        if (duplicatePhone) {
+            return alert("This remark name is already used. Please use a different name.");
+        }
+
+        allRemarks[phone] = remark;
+    } else {
+        delete allRemarks[phone];
+    }
 
     const db = await openDB();
     const tx = db.transaction(remarkStore, "readwrite");
@@ -139,27 +154,70 @@ async function saveSession(phone, keys, username) {
 async function checkExistingSession() {
     const phone = sessionStorage.getItem("chat_activePhone");
     const user = sessionStorage.getItem("chat_myUsername");
-    const keyData = localStorage.getItem(`chat_keys_${phone}`);
-    if (!phone || !keyData) { showPage("page-login"); return; }
+
+    if (!phone || !user) {
+        showPage("page-login");
+        return;
+    }
+
+    let keyData = localStorage.getItem(`chat_keys_${phone}`);
+
+    if (!keyData) {
+        myKeys = await crypto.subtle.generateKey(
+            {
+                name: "RSA-OAEP",
+                modulusLength: 2048,
+                publicExponent: new Uint8Array([1, 0, 1]),
+                hash: "SHA-256"
+            },
+            true,
+            ["encrypt", "decrypt"]
+        );
+
+        await saveSession(phone, myKeys, user);
+
+        keyData = localStorage.getItem(`chat_keys_${phone}`);
+    }
+
     try {
         const parsed = JSON.parse(keyData);
+
         myKeys = {
-            publicKey: await crypto.subtle.importKey("jwk", parsed.publicKey, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]),
-            privateKey: await crypto.subtle.importKey("jwk", parsed.privateKey, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["decrypt"])
+            publicKey: await crypto.subtle.importKey(
+                "jwk",
+                parsed.publicKey,
+                { name: "RSA-OAEP", hash: "SHA-256" },
+                true,
+                ["encrypt"]
+            ),
+            privateKey: await crypto.subtle.importKey(
+                "jwk",
+                parsed.privateKey,
+                { name: "RSA-OAEP", hash: "SHA-256" },
+                true,
+                ["decrypt"]
+            )
         };
-        myPhone = phone; myUsername = user;
-        
+
+        myPhone = phone;
+        myUsername = user;
+
         allConversations = await loadHistoryFromDB(myPhone);
-        await loadRemarks(); // Load nicknames
+        await loadRemarks();
 
         document.getElementById("display-my-username").innerText = myUsername;
         showPage("page-chat");
+
         socket.emit("join", myPhone);
-        loadUsers(); 
+        loadUsers();
         await fetchOfflineMessages();
         addKeyboardSupport();
         await fetchBlockedUsers();
-    } catch (e) { showPage("page-login"); }
+
+    } catch (e) {
+        console.error(e);
+        showPage("page-login");
+    }
 }
 
 function logout() { sessionStorage.clear(); location.reload(); }
@@ -276,7 +334,7 @@ async function decryptPayload(payload) {
 async function sendEncrypted(mediaData = null, mediaType = "text") {
     const input = document.getElementById("msg-input");
     const content = mediaData || input.value;
-    if (!selectedTarget || !content) return;
+    if (!selectedTarget || (!mediaData && (!content || content.trim() === ""))) {alert("Message cannot be empty."); return; }
     if (isEditing && !mediaData) { performEdit(content); return; }
     if (myBlockedUsers.includes(selectedTarget)) {
         alert(`You have blocked this user. You must unblock them before you can send a message.`);
@@ -285,17 +343,21 @@ async function sendEncrypted(mediaData = null, mediaType = "text") {
     try {
         const res = await fetch(`/get_key/${selectedTarget}`);
         const k = await res.json();
+        const startEncrypt = performance.now();
         const pubKey = await crypto.subtle.importKey("spki", Uint8Array.from(atob(k.publicKey), c => c.charCodeAt(0)), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
         const aes = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const encC = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aes, new TextEncoder().encode(content));
         const encA = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, pubKey, await crypto.subtle.exportKey("raw", aes));
         const msgId = Date.now().toString() + Math.random().toString().slice(2, 8);
-        const payload = { aesKey: arrayBufferToBase64(encA), iv: arrayBufferToBase64(iv), data: arrayBufferToBase64(encC), mediaType, msgId };
+        const timestamp = new Date().toISOString();
+        const payload = { aesKey: arrayBufferToBase64(encA), iv: arrayBufferToBase64(iv), data: arrayBufferToBase64(encC), mediaType, msgId, timestamp };
+        const endEncrypt = performance.now();
+        console.log("Encryption Time:", (endEncrypt - startEncrypt).toFixed(2), "ms");
 
         socket.emit("chat_message", { sender: myPhone, recipient: selectedTarget, payload });
         if (!allConversations[selectedTarget]) allConversations[selectedTarget] = [];
-        allConversations[selectedTarget].push({ text: content, type: "sent", mediaType, msgId });
+        allConversations[selectedTarget].push({ text: content, type: "sent", mediaType, msgId, timestamp });
         if (!mediaData) input.value = "";
         await saveHistory(); refreshChatWindow();
     } catch (e) { console.error(e); }
@@ -313,7 +375,7 @@ async function performEdit(newText) {
         const newPayload = { aesKey: arrayBufferToBase64(encA), iv: arrayBufferToBase64(iv), data: arrayBufferToBase64(encC), mediaType: "text", msgId: editMsgId, isEdited: true };
         socket.emit("edit_message", { msgId: editMsgId, newPayload, sender: myPhone, recipient: selectedTarget });
         const idx = allConversations[selectedTarget].findIndex(m => m.msgId === editMsgId);
-        if (idx !== -1) allConversations[selectedTarget][idx].text = newText + " (edited)";
+        if (idx !== -1) {allConversations[selectedTarget][idx].text = newText;allConversations[selectedTarget][idx].isEdited = true;}
         isEditing = false; editMsgId = null; document.getElementById("msg-input").value = ""; document.getElementById("send-btn").innerText = "Send";
         await saveHistory(); refreshChatWindow();
     } catch (e) { console.error(e); }
@@ -343,6 +405,27 @@ function deleteMessage(msgId) {
     refreshChatWindow();
 }
 
+async function deleteConversation(phone) {
+
+    if (!confirm("Delete this chat permanently from your chat list?")) {
+        return;
+    }
+    delete allConversations[phone];
+    delete unreadCounts[phone];
+    closeContactInfo();
+    if (selectedTarget === phone) {
+        selectedTarget = "";
+        selectedUsername = "";
+        document.getElementById("chat-target-name").innerText = "";
+        document.getElementById("chat-header").classList.add("hidden");
+        document.getElementById("input-area").classList.add("hidden");
+        document.getElementById("empty-state").classList.remove("hidden");
+        document.getElementById("message-pane").innerHTML = "";
+    }
+    await saveHistory();
+    renderUserList();
+}
+
 function startEdit(msgId, oldText) { 
     isEditing = true; editMsgId = msgId; 
     document.getElementById("msg-input").value = oldText.replace(" (edited)", ""); 
@@ -357,62 +440,139 @@ function copyText(text) { navigator.clipboard.writeText(text.replace(" (edited)"
 async function processIncomingMessage(data) {
     if (String(data.sender) === String(myPhone)) return;
     const payload = typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload;
+
+    if (payload.timestamp) {
+    const sentTime = new Date(payload.timestamp).getTime();
+    const receivedTime = new Date().getTime();
+    console.log("Message Delivery Time:", receivedTime - sentTime, "ms");
+    }
     if (payload.isDeleted) return; 
     const message = await decryptPayload(payload); if (!message) return;
     if (!allConversations[data.sender]) allConversations[data.sender] = [];
     if (!allConversations[data.sender].some(m => m.msgId === payload.msgId)) {
-        allConversations[data.sender].push({ text: message, type: "received", mediaType: payload.mediaType, msgId: payload.msgId });
+        allConversations[data.sender].push({ text: message, type: "received", mediaType: payload.mediaType, msgId: payload.msgId, timestamp: payload.timestamp});
         await saveHistory(); if (String(selectedTarget) !== String(data.sender)) unreadCounts[data.sender] = (unreadCounts[data.sender] || 0) + 1;
     }
     if (String(selectedTarget) === String(data.sender)) refreshChatWindow();
-    renderUserList();
+        renderUserList();
+
+        const senderUser =
+        window.allUsers.find(
+            u => String(u.phone) === String(data.sender)
+        );
+
+    const senderName =
+        senderUser?.username || data.sender;
+
+    if (
+        !isLoadingOfflineMessages &&
+        "Notification" in window &&
+        Notification.permission === "granted"
+    ) {
+        const notification = new Notification(senderName, {
+            body: "New message received",
+            icon: "/static/images/chipchat.png"
+        });
+
+        notification.onclick = function () {
+            window.focus();
+        };
+    }
 }
 
 async function fetchOfflineMessages() {
-    const res = await fetch(`/fetch_messages/${myPhone}`);
-    const d = await res.json();
-    if (d.messages) for (let m of d.messages) if (String(m.recipient) === String(myPhone)) await processIncomingMessage(m);
+    isLoadingOfflineMessages = true;
+
+    try {
+        const res = await fetch(`/fetch_messages/${myPhone}`);
+        const d = await res.json();
+
+        if (d.messages) {
+            for (let m of d.messages) {
+                if (String(m.recipient) === String(myPhone)) {
+                    await processIncomingMessage(m);
+                }
+            }
+        }
+    } finally {
+        isLoadingOfflineMessages = false;
+    }
 }
 
 function renderUserList() {
     const l = document.getElementById("user-list"); 
-    if(!l) return; 
+    if (!l) return; 
     l.innerHTML = "";
-    
-    const term = document.getElementById("user-search") ? document.getElementById("user-search").value.toLowerCase() : "";
+
+    const searchBox = document.getElementById("user-search");
+    const term = searchBox ? searchBox.value.trim() : "";
+
+    let shownCount = 0;
 
     window.allUsers.forEach(u => {
         if (String(u.phone) === String(myPhone)) return;
-        
-        // 1. Get the display name (Username or Remark)
-        const displayName = getDisplayName(u.phone, u.username).toLowerCase();
-        
-        // 2. Get the phone number as a string
+
         const phoneNumber = String(u.phone);
+        const displayName = getDisplayName(u.phone, u.username).toLowerCase();
+        const searchTerm = term.toLowerCase();
 
-        // --- NEW SEARCH LOGIC ---
-        // Match if the search term is found in the Name OR in the Phone Number
-        const matchesName = displayName.includes(term);
-        const matchesPhone = phoneNumber.includes(term);
+        const hasHistory =
+            allConversations[u.phone] &&
+            allConversations[u.phone].length > 0;
 
-        if (matchesName || matchesPhone) {
-            const d = document.createElement("div");
-            d.className = "user-item" + (selectedTarget === u.phone ? " active-user" : "");
-            
-            // We still only show the Username/Remark on the UI, 
-            // but the search works for both in the background.
-            d.innerHTML = `<div><strong>${getDisplayName(u.phone, u.username)}</strong></div>`;
+        let shouldShow = false;
 
-            if (unreadCounts[u.phone]) { 
-                const b = document.createElement("span"); 
-                b.className = "unread-badge"; 
-                b.innerText = unreadCounts[u.phone]; 
-                d.appendChild(b); 
+        if (term === "") {
+            shouldShow = hasHistory;
+        } else {
+            if (hasHistory) {
+                shouldShow =
+                    phoneNumber.includes(term) ||
+                    displayName.includes(searchTerm);
+            } else {
+                shouldShow = phoneNumber === term;
             }
-            d.onclick = () => selectRecipient(u.phone, u.username);
-            l.appendChild(d);
         }
+
+        if (!shouldShow) return;
+
+        const d = document.createElement("div");
+        d.className = "user-item" + (selectedTarget === u.phone ? " active-user" : "");
+
+        d.innerHTML = `<div><strong>${getDisplayName(u.phone, u.username)}</strong></div>`;
+
+        if (unreadCounts[u.phone]) { 
+            const b = document.createElement("span"); 
+            b.className = "unread-badge"; 
+            b.innerText = unreadCounts[u.phone]; 
+            d.appendChild(b); 
+        }
+
+        d.onclick = () => selectRecipient(u.phone, u.username);
+        l.appendChild(d);
+        shownCount++;
     });
+
+    if (shownCount === 0) {
+        if (window.innerWidth <= 600 && term === "") {
+
+                l.innerHTML = `
+                    <div class="empty-user-list">
+                        <img src="/static/images/chipchat.png" alt="ChipChat">
+                        <p>End-to-End Encrypted Messaging</p>
+                        <small>Search a phone number to start chatting</small></div>`;
+            } else if (term === "") {
+                l.innerHTML = `
+                    <div class="text-muted small p-3">No conversations yet.</div>`;
+            } else {
+                l.innerHTML = `<div class="text-muted small p-3">No registered user found.</div>`;
+            }
+        }
+}
+
+function clearSearch() {
+    document.getElementById("user-search").value = "";
+    renderUserList();
 }
 
 function selectRecipient(p, name) { 
@@ -424,56 +584,193 @@ function selectRecipient(p, name) {
     document.getElementById("empty-state").classList.add("hidden"); 
     document.getElementById("chat-header").classList.remove("hidden"); 
     document.getElementById("input-area").classList.remove("hidden"); 
+
+    // Mobile: after selecting user, hide sidebar and show full chat
+    if (window.innerWidth <= 768) {
+        document.getElementById("page-chat").classList.add("mobile-chat-open");
+    }
     renderUserList(); 
     refreshChatWindow(); 
 }
 
+function backToUserList() {
+    if (window.innerWidth <= 768) {
+        document.getElementById("page-chat").classList.remove("mobile-chat-open");
+
+        selectedTarget = "";
+        selectedUsername = "";
+
+        document.getElementById("chat-target-name").innerText = "";
+        document.getElementById("chat-header").classList.add("hidden");
+        document.getElementById("input-area").classList.add("hidden");
+        document.getElementById("empty-state").classList.remove("hidden");
+        document.getElementById("message-pane").innerHTML = "";
+
+        renderUserList();
+    }
+}
+
 function refreshChatWindow() {
-    const p = document.getElementById("message-pane"); 
+
+    const p = document.getElementById("message-pane");
     p.innerHTML = "";
-    
+
+    let lastDate = "";
+
     (allConversations[selectedTarget] || []).forEach(m => {
+
+        // ===== WhatsApp-style Date Divider =====
+        if (m.timestamp) {
+            const msgDate = new Date(m.timestamp);
+
+            const today = new Date();
+
+            const yesterday = new Date();
+            yesterday.setDate(today.getDate() - 1);
+
+            let dateLabel = "";
+
+            if (msgDate.toDateString() === today.toDateString()) {
+                dateLabel = "Today";
+            } 
+            else if (msgDate.toDateString() === yesterday.toDateString()) {
+                dateLabel = "Yesterday";
+            } 
+            else {
+                dateLabel = msgDate.toLocaleDateString("en-GB", {
+                    day: "2-digit",
+                    month: "long",
+                    year: "numeric"
+                });
+            }
+
+            if (dateLabel !== lastDate) {
+                const divider = document.createElement("div");
+                divider.className = "date-divider";
+                divider.innerHTML = `<span>${dateLabel}</span>`;
+                p.appendChild(divider);
+
+                lastDate = dateLabel;
+            }
+        }
+
         const d = document.createElement("div");
         d.className = "msg " + (m.type === "sent" ? "msg-sent" : "msg-received");
 
         if (m.isDeleted) {
-            d.innerHTML = `<i style="opacity:0.5; font-size: 13px;">🚫 This message was deleted</i>`;
+            d.innerHTML = `<i style="opacity:0.5;font-size:13px;">🚫 This message was deleted</i>`;
         } else {
-            // 1. Render the Content
-            if (m.mediaType === "audio") { 
-                const a = document.createElement("audio"); a.src = m.text; a.controls = true; d.appendChild(a); 
-            } else if (m.mediaType === "image") { 
-                const i = document.createElement("img"); i.src = m.text; i.onclick = () => i.classList.toggle('img-big'); d.appendChild(i); 
-            } else if (m.mediaType === "video") {
-                const v = document.createElement("video"); v.src = m.text; v.controls = true; d.appendChild(v);
-            } else { 
-                d.innerText = m.text; 
+            if (m.mediaType === "audio") {
+                const a = document.createElement("audio");
+                a.src = m.text;
+                a.controls = true;
+                d.appendChild(a);
+            } 
+            else if (m.mediaType === "image") {
+                const i = document.createElement("img");
+                i.src = m.text;
+                i.onclick = () => i.classList.toggle("img-big");
+                d.appendChild(i);
+            } 
+            else if (m.mediaType === "video") {
+                const v = document.createElement("video");
+                v.src = m.text;
+                v.controls = true;
+                d.appendChild(v);
+            } 
+            else {
+                const text = document.createElement("span");
+                text.innerText = m.text;
+                d.appendChild(text);
             }
 
-            // 2. Render the Action Menu
+            const meta = document.createElement("div");
+            meta.className = "msg-meta";
+
+            let timeText = "";
+            if (m.timestamp) {
+                timeText = new Date(m.timestamp).toLocaleTimeString([], {
+                    hour: "numeric",
+                    minute: "2-digit"
+                });
+            }
+
+            meta.innerHTML = timeText + (m.isEdited ? " · edited" : "");
+            d.appendChild(meta);
+
             const menu = document.createElement("div");
             menu.className = "msg-menu";
-            
-            // --- FIX: Show Rubbish Bin for EVERYONE ---
-            menu.innerHTML += `<span title="Delete" onclick="deleteMessage('${m.msgId}')">🗑️</span> `;
-            
-            // --- Edit Icon: ONLY for messages YOU sent (and only if it's text) ---
+
+            menu.innerHTML += `<span onclick="deleteMessage('${m.msgId}')">🗑️</span>`;
+
             if (m.type === "sent" && (!m.mediaType || m.mediaType === "text")) {
                 const safeText = m.text.replace(/'/g, "\\'");
-                menu.innerHTML += `<span title="Edit" onclick="startEdit('${m.msgId}', '${safeText}')">✏️</span> `;
+                menu.innerHTML += `<span onclick="startEdit('${m.msgId}','${safeText}')">✏️</span>`;
             }
 
-            // --- Copy Icon: For any text message (Sent or Received) ---
             if (!m.mediaType || m.mediaType === "text") {
                 const safeText = m.text.replace(/'/g, "\\'");
-                menu.innerHTML += `<span title="Copy" onclick="copyText('${safeText}')">📋</span>`;
+                menu.innerHTML += `<span onclick="copyText('${safeText}')">📋</span>`;
             }
 
             d.appendChild(menu);
+
+            let pressTimer;
+
+            d.addEventListener("touchstart", function(e) {
+                if (
+                    e.target.tagName === "AUDIO" ||
+                    e.target.tagName === "VIDEO" ||
+                    e.target.tagName === "IMG"
+                ) return;
+
+                pressTimer = setTimeout(() => {
+                    document
+                        .querySelectorAll(".msg.show-menu")
+                        .forEach(x => x.classList.remove("show-menu"));
+
+                    d.classList.add("show-menu");
+                }, 800);
+            });
+
+            d.addEventListener("touchend", () => {
+                clearTimeout(pressTimer);
+            });
+
+            d.addEventListener("touchmove", () => {
+                clearTimeout(pressTimer);
+            });
         }
+
         p.appendChild(d);
     });
+
     p.scrollTop = p.scrollHeight;
+}
+
+document.addEventListener("click", function(e) {
+
+    if (!e.target.closest(".msg")) {
+
+        document
+            .querySelectorAll(".msg.show-menu")
+            .forEach(x =>
+                x.classList.remove("show-menu")
+            );
+    }
+
+});
+
+function togglePassword(id, btn) {
+    const input = document.getElementById(id);
+
+    if (input.type === "password") {
+        input.type = "text";
+        btn.innerText = "Hide";
+    } else {
+        input.type = "password";
+        btn.innerText = "Show";
+    }
 }
 
 // ====================== MEDIA & LISTENERS ======================
@@ -525,7 +822,8 @@ socket.on("message_edited", async data => {
     const idx = allConversations[data.sender]?.findIndex(m => m.msgId === data.msgId);
     if (idx !== -1) { 
         const txt = await decryptPayload(data.newPayload); 
-        if (txt) { allConversations[data.sender][idx].text = txt + " (edited)"; await saveHistory(); if (selectedTarget === data.sender) refreshChatWindow(); } 
+        if (txt) { allConversations[data.sender][idx].text = txt; allConversations[data.sender][idx].isEdited = true; await saveHistory(); 
+        if (selectedTarget === data.sender) refreshChatWindow(); } 
     }
 });
 
@@ -568,45 +866,39 @@ socket.on("user_phone_changed", async (data) => {
     }
 });
 
+socket.on("force_logout", (data) => {
+    alert(data.message || "You have been logged out because this account logged in on another device.");
+    sessionStorage.clear();
+    location.reload();
+});
+
 async function handleFileSelect(event, type) {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
     const fileArray = Array.from(files);
-    const total = fileArray.length;
+    const maxSize = 15 * 1024 * 1024; // 15MB
 
-    console.log(`Starting secure transfer of ${total} files...`);
-
-    for (let i = 0; i < total; i++) {
+    for (let i = 0; i < fileArray.length; i++) {
         const file = fileArray[i];
 
-        // 1. Size Check
-        if (file.size > 10 * 1024 * 1024) { 
-            alert(`File "${file.name}" ignored: Too large.`);
+        if (file.size > maxSize) { 
+            alert(`File "${file.name}" is too large. Maximum file size is 15MB.`);
             continue; 
         }
 
-        // 2. Wrap FileReader in a Promise for strict sequential processing
         await new Promise((resolve) => {
             const reader = new FileReader();
+
             reader.onload = async (e) => {
-                // Perform the E2EE Send
                 await sendEncrypted(e.target.result, type);
-                
-                // --- BREATHING ROOM ---
-                // We wait 100ms between images to let the browser 
-                // clean up memory and update the UI.
                 setTimeout(resolve, 100); 
             };
+
             reader.readAsDataURL(file);
         });
-
-        console.log(`Sent ${i + 1} of ${total}`);
     }
-
-    // Reset input so it's ready for the next batch
     event.target.value = "";
-    alert(`${total} files sent successfully!`);
 }
 
 let mediaRecorder, audioChunks = [], isRecording = false, shouldSend = true;
@@ -724,19 +1016,40 @@ async function handleAuth(type) {
         const d = await res.json();
         if (!res.ok) return alert(d.message || "Please check the phone number and password.");
 
-        // WHATSAPP SECURITY LOGIC: Check if this browser has the keys for this account
-        const keyData = localStorage.getItem(`chat_keys_${phone}`);
-        if (!keyData) {
-            return alert("E2EE Security Error: Your Private Key was not found on this device. You can only log in on the device used to register.");
-        }
-
         myUsername = d.username;
     }
 
-    // Success: Set session variables and enter chat
-    myPhone = phone; 
-    await saveSession(myPhone, myKeys, myUsername); 
-    await checkExistingSession();
+// Success: Set session variables and enter chat
+myPhone = phone;
+
+if (!myKeys) {
+    myKeys = await crypto.subtle.generateKey(
+        {
+            name: "RSA-OAEP",
+            modulusLength: 2048,
+            publicExponent: new Uint8Array([1, 0, 1]),
+            hash: "SHA-256"
+        },
+        true,
+        ["encrypt", "decrypt"]
+    );
+}
+
+await saveSession(myPhone, myKeys, myUsername);
+
+const exportedKey = await crypto.subtle.exportKey("spki", myKeys.publicKey);
+const publicKey = arrayBufferToBase64(exportedKey);
+
+await fetch("/update_public_key", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+        phone: myPhone,
+        publicKey: publicKey
+    })
+});
+
+await checkExistingSession();
 }
 
 // ====================== FORGOT PASSWORD LOGIC ======================
@@ -750,30 +1063,37 @@ async function sendOTP() {
         body: JSON.stringify({ phone })
     });
 
+    const data = await res.json();
+
     if (res.ok) {
         forgotFlowData.phone = phone;
+
+        alert("Your OTP is: " + data.otp + "\nThis OTP will expire in 5 minutes.");
+
         document.getElementById("forgot-step-1").classList.add("hidden");
         document.getElementById("forgot-step-2").classList.remove("hidden");
     } else {
-        alert("User not found");
+        alert(data.message || "User not found");
     }
 }
 
 async function verifyOTP() {
     const otp = document.getElementById("forgot-otp").value.trim();
-    
+
     const res = await fetch("/forgot_password_verify_otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: forgotFlowData.phone, otp: otp })
     });
 
+    const data = await res.json();
+
     if (res.ok) {
         forgotFlowData.otp = otp;
         document.getElementById("forgot-step-2").classList.add("hidden");
         document.getElementById("forgot-step-3").classList.remove("hidden");
     } else {
-        alert("Invalid OTP code.");
+        alert(data.message || "Invalid OTP code.");
     }
 }
 
@@ -781,8 +1101,19 @@ async function resetPassword() {
     const newPass = document.getElementById("forgot-new-pass").value;
     const confirmPass = document.getElementById("forgot-confirm-pass").value;
 
-    if (newPass !== confirmPass) return alert("Passwords do not match");
-    if (newPass.length < 8) return alert("Password too weak");
+    const passwordPattern = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&._-])[A-Za-z\d@$!%*?&._-]{8,}$/;
+
+    if (!newPass || !confirmPass) {
+        return alert("Please fill in both password fields");
+    }
+
+    if (!passwordPattern.test(newPass)) {
+        return alert("Password must be at least 8 characters and include uppercase, lowercase, number, and special character (@$!%*?&._-).");
+    }
+
+    if (newPass !== confirmPass) {
+        return alert("Passwords do not match");
+    }
 
     const res = await fetch("/forgot_password_reset", {
         method: "POST",
@@ -794,12 +1125,27 @@ async function resetPassword() {
         })
     });
 
+    const data = await res.json();
+
     if (res.ok) {
         alert("Password updated! Please login.");
         showPage("page-login");
     } else {
-        alert("Reset failed.");
+        alert(data.message || "Reset failed.");
     }
 }
 
-window.onload = checkExistingSession;
+// ====================== NOTIFICATION LOGIC ======================
+
+async function requestNotificationPermission() {
+    if ("Notification" in window) {
+        if (Notification.permission !== "granted") {
+            await Notification.requestPermission();
+        }
+    }
+}
+
+window.onload = async () => {
+    await requestNotificationPermission();
+    checkExistingSession();
+};
